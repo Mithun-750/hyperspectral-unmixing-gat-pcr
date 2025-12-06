@@ -36,17 +36,6 @@ ENV/
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Results and outputs (keep directory structure)
-results/*.png
-results/*.fig
-*.png
-*.fig
-!results/.gitkeep
-
-# Data files (keep structure but ignore large files)
-data/*.mat
-*.mat
-!data/.gitkeep
 
 # Model checkpoints
 *.h5
