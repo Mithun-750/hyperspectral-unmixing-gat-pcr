@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Results and outputs (keep directory structure)
+results/*.png
+results/*.fig
+*.png
+*.fig
+!results/.gitkeep
+
+# Data files (keep structure but ignore large files)
+data/*.mat
+*.mat
+!data/.gitkeep
+
+# Model checkpoints
+*.h5
+*.keras
+*.ckpt
+trained_unmixing_model/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
