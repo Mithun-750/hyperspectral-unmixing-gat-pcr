@@ -247,10 +247,8 @@ class CrossAttentionFusion(nn.Module):
         FC = torch.sigmoid(self.linear_local(FC_input))  # [B, P, H, W]
         SG_hat = self.beta * FC * SC + SG
 
-        # Final fusion
-        S_raw = SG_hat + SC_hat
-        S = torch.clamp(S_raw, min=1e-8)
-        S = S / (torch.sum(S, dim=1, keepdim=True) + 1e-8)
+        # Final fusion - use softmax for proper probability distribution
+        S = F.softmax(SG_hat + SC_hat, dim=1)
         return S
 
 # ==========================================
@@ -322,10 +320,10 @@ class ACDEDecoder(nn.Module):
         B, P, H, W = abundances.shape
         N = H * W
 
-        # Ensure M is non-negative and normalized
+        # Ensure M is non-negative and L2 normalized (preserves spectral contrast)
         M_constrained = F.relu(self.M)
         M_constrained = M_constrained / \
-            (torch.sum(M_constrained, dim=0, keepdim=True) + 1e-8)
+            (torch.norm(M_constrained, p=2, dim=0, keepdim=True) + 1e-8)
 
         # Flatten for reconstruction
         A_flat = abundances.permute(0, 2, 3, 1).reshape(B * N, P)  # [B*N, P]
@@ -473,35 +471,27 @@ class MSGACD_Unmixer(nn.Module):
             global_abund = self.gat_encoder(super_feats, adj)  # [B, K, P]
 
         # Project global abundances back to pixel space
+        # Normalize GAT outputs first to ensure they're in valid range
+        global_abund = F.softmax(global_abund, dim=-1)
+
         # A_global = Q * A_nodes
         # [B, N, K] x [B, K, P] -> [B, N, P]
         global_abund_pixel = torch.bmm(Q, global_abund)
         global_abund_pixel = global_abund_pixel.permute(
             0, 2, 1).view(B, -1, H, W)
 
+        # Ensure global abundances are normalized
+        global_abund_pixel = F.softmax(global_abund_pixel, dim=1)
+
         # 2. Local CNN Branch
         local_abund = self.cnn_encoder(x)  # [B, P, H, W]
-
-        # 2-stage warm-up: disable CNN for first 20 epochs
-        if self.warmup_enabled:
-            local_abund = 0 * local_abund
+        local_abund = F.softmax(local_abund, dim=1)
 
         # 3. Fusion
         fused_abund = self.fusion(global_abund_pixel, local_abund)
 
-        # 4. Inter-Superpixel PCR smoothing
-        # Get superpixel segments from DiffSLIC
-        # Q has shape [B, N, K] where N = H*W
-        Q_argmax = torch.argmax(Q[0], dim=-1)  # [N] where N = H*W
-        # Ensure segments match the actual fused_abund shape
-        fused_H, fused_W = fused_abund.shape[2], fused_abund.shape[3]
-        if Q_argmax.shape[0] == fused_H * fused_W:
-            segments = Q_argmax.reshape(fused_H, fused_W).cpu().numpy()
-        else:
-            # Dimensions don't match - use None to let PCR create dummy segments
-            segments = None
-        smoothed_abund = self.pcr(fused_abund, superpixel_segments=segments,
-                                  alpha=torch.clamp(self.alpha_pcr, 0.0, 1.0))
+        # 4. Inter-Superpixel PCR smoothing (disabled for now)
+        smoothed_abund = fused_abund
 
         # 5. Reconstruction
         reconstruction, endmembers = self.decoder(smoothed_abund, x)
@@ -563,6 +553,43 @@ def spatial_tv_loss(abundances):
 
     tv_loss = torch.mean(torch.abs(diff_h)) + torch.mean(torch.abs(diff_v))
     return tv_loss
+
+
+def reweighted_tv_loss(abundances, image, alpha=1.0):
+    """
+    Adaptive Abundance Smoothing (AAS) with Reweighted TV.
+    Smooths abundances strongly in homogeneous regions but preserves edges.
+
+    abundances: [B, P, H, W]
+    image: [B, C, H, W] - original hyperspectral image
+    alpha: edge sensitivity parameter
+    """
+    B, P, H, W = abundances.shape
+
+    # Compute edge strength from original image
+    # Use spectral gradient magnitude
+    img_grad_h = image[:, :, :, 1:] - image[:, :, :, :-1]  # [B, C, H, W-1]
+    img_grad_v = image[:, :, 1:, :] - image[:, :, :-1, :]  # [B, C, H-1, W]
+
+    edge_strength_h = torch.norm(img_grad_h, p=2, dim=1)  # [B, H, W-1]
+    edge_strength_v = torch.norm(img_grad_v, p=2, dim=1)  # [B, H-1, W]
+
+    # Compute weights (inverse of edge strength)
+    w_h = torch.exp(-alpha * edge_strength_h)  # [B, H, W-1]
+    w_v = torch.exp(-alpha * edge_strength_v)  # [B, H-1, W]
+
+    # Abundance gradients
+    abund_grad_h = abundances[:, :, :, 1:] - \
+        abundances[:, :, :, :-1]  # [B, P, H, W-1]
+    abund_grad_v = abundances[:, :, 1:, :] - \
+        abundances[:, :, :-1, :]  # [B, P, H-1, W]
+
+    # Reweighted TV: weighted L1 norm of gradients
+    rtv_h = torch.abs(abund_grad_h) * w_h.unsqueeze(1)  # [B, P, H, W-1]
+    rtv_v = torch.abs(abund_grad_v) * w_v.unsqueeze(1)  # [B, P, H-1, W]
+
+    rtv_loss = torch.mean(rtv_h) + torch.mean(rtv_v)
+    return rtv_loss
 
 
 def endmember_orthogonality_loss(endmembers):
@@ -688,11 +715,6 @@ def train_unmixer(data_path=None, endmember_path=None):
 
         model.warmup_enabled = False
 
-        if epoch < 50:
-            model.decoder.M.requires_grad = False
-        else:
-            model.decoder.M.requires_grad = True
-
         recon, abundances, endmembers, global_abund, adj = model(img_tensor)
 
         # Use normalized abundances for losses (fused abundances are already softmax'd)
@@ -717,17 +739,20 @@ def train_unmixer(data_path=None, endmember_path=None):
             diff**2) if epoch >= 50 else torch.tensor(0.0, device=device)
 
         # Graph Laplacian regularization for smoothness (FIXED: use trace)
-        B, K, P = global_abund.shape
-        adj_float = adj.float()
-        deg = torch.sum(adj_float, dim=-1, keepdim=True)  # [B, K, 1]
-        lap = torch.diag_embed(deg.squeeze(-1)) - adj_float  # [B, K, K]
+        if epoch >= 200:
+            B, K, P = global_abund.shape
+            adj_float = adj.float()
+            deg = torch.sum(adj_float, dim=-1, keepdim=True)  # [B, K, 1]
+            lap = torch.diag_embed(deg.squeeze(-1)) - adj_float  # [B, K, K]
 
-        # Smoothness: trace(A^T * L * A) - correct formulation
-        lap_A = torch.bmm(lap, global_abund)  # [B, K, P]
-        smooth_graph = torch.bmm(
-            global_abund.transpose(1, 2), lap_A)  # [B, P, P]
-        l_graph = torch.mean(torch.diagonal(
-            smooth_graph, dim1=1, dim2=2))  # [B, P] -> scalar
+            # Smoothness: trace(A^T * L * A) - correct formulation
+            lap_A = torch.bmm(lap, global_abund)  # [B, K, P]
+            smooth_graph = torch.bmm(
+                global_abund.transpose(1, 2), lap_A)  # [B, P, P]
+            l_graph = torch.mean(torch.diagonal(
+                smooth_graph, dim1=1, dim2=2))  # [B, P] -> scalar
+        else:
+            l_graph = torch.tensor(0.0, device=device)
 
         l_endmember_sad = torch.tensor(0.0, device=device)
         if M_true is not None and epoch >= 50:
@@ -742,13 +767,13 @@ def train_unmixer(data_path=None, endmember_path=None):
                 l_endmember_sad += angle
             l_endmember_sad = l_endmember_sad / num_endmembers
 
-        if epoch < 50:
+        if epoch < 200:
             w_sad = 3.0
             w_mse = 0.5
             w_sparse = 0.0
             w_cluster = 0.0
             w_smooth = 0.0
-            w_graph = 0.1
+            w_graph = 0.0
             w_dirichlet = 0.0
             w_tv = 0.0
             w_ortho = 0.0
@@ -756,34 +781,21 @@ def train_unmixer(data_path=None, endmember_path=None):
             l_dirichlet = torch.tensor(0.0, device=device)
             l_tv_spatial = torch.tensor(0.0, device=device)
             l_ortho = torch.tensor(0.0, device=device)
-        elif epoch < 150:
+            l_graph = torch.tensor(0.0, device=device)
+        else:
             w_sad = 3.0
             w_mse = 0.5
             w_sparse = 0.0
             w_cluster = 0.0
-            w_smooth = 0.05
-            w_graph = 0.1
+            w_smooth = 0.0
+            w_graph = 0.05
             w_dirichlet = 0.0
             w_tv = 0.02
             w_ortho = 0.0
-            w_endmember_sad = 0.5
+            w_endmember_sad = 0.0
             l_dirichlet = torch.tensor(0.0, device=device)
-            l_tv_spatial = spatial_tv_loss(A)
+            l_tv_spatial = reweighted_tv_loss(A, img_crop, alpha=1.0)
             l_ortho = torch.tensor(0.0, device=device)
-        else:
-            w_sad = 3.0
-            w_mse = 0.5
-            w_sparse = 0.03
-            w_cluster = 0.001
-            w_smooth = 0.1
-            w_graph = 0.1
-            w_dirichlet = 0.01
-            w_tv = 0.05
-            w_ortho = 0.01
-            w_endmember_sad = 0.5
-            l_dirichlet = dirichlet_loss(A, alpha=0.1)
-            l_tv_spatial = spatial_tv_loss(A)
-            l_ortho = endmember_orthogonality_loss(endmembers)
 
         total_loss = (
             w_sad * l_sad +
