@@ -248,7 +248,9 @@ class CrossAttentionFusion(nn.Module):
         SG_hat = self.beta * FC * SC + SG
 
         # Final fusion
-        S = F.softmax(SG_hat + SC_hat, dim=1)
+        S_raw = SG_hat + SC_hat
+        S = torch.clamp(S_raw, min=1e-8)
+        S = S / (torch.sum(S, dim=1, keepdim=True) + 1e-8)
         return S
 
 # ==========================================
@@ -422,7 +424,7 @@ class MSGACD_Unmixer(nn.Module):
         self.pcr = InterSuperpixelPCR()
         self.decoder = ACDEDecoder(num_endmembers, num_bands, init_M=init_M)
 
-        self.alpha_pcr = nn.Parameter(torch.tensor(0.5))
+        self.alpha_pcr = nn.Parameter(torch.tensor(0.3))
 
         self.H = H
         self.W = W
@@ -677,7 +679,14 @@ def train_unmixer(data_path=None, endmember_path=None):
     for epoch in range(epochs):
         optimizer.zero_grad()
 
-        model.warmup_enabled = (epoch < 50)
+        if epoch < 60:
+            for p in model.gat_encoder.parameters():
+                p.requires_grad = False
+        else:
+            for p in model.gat_encoder.parameters():
+                p.requires_grad = True
+
+        model.warmup_enabled = False
 
         if epoch < 50:
             model.decoder.M.requires_grad = False
