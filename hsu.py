@@ -1152,14 +1152,14 @@ def train_unmixer(data_path=None, endmember_path=None):
         for i in range(num_endmembers):
             # Estimated abundance maps
             plt.subplot(2, num_endmembers, i + 1)
-            plt.imshow(abund_maps[:, :, i], cmap='jet')
+            plt.imshow(abund_maps[:, :, i], cmap='viridis')
             plt.colorbar()
             plt.title(f'Estimated Abundance {i+1}')
             plt.axis('off')
 
             # Ground truth
             plt.subplot(2, num_endmembers, i + 1 + num_endmembers)
-            plt.imshow(A_true_reshaped[:, :, i], cmap='jet')
+            plt.imshow(A_true_reshaped[:, :, i], cmap='viridis')
             plt.colorbar()
             plt.title(f'Ground Truth Abundance {i+1}')
             plt.axis('off')
@@ -1172,7 +1172,7 @@ def train_unmixer(data_path=None, endmember_path=None):
         plt.figure(figsize=(15, 5))
         for i in range(num_endmembers):
             plt.subplot(1, num_endmembers, i + 1)
-            plt.imshow(abund_maps[:, :, i], cmap='jet')
+            plt.imshow(abund_maps[:, :, i], cmap='viridis')
             plt.colorbar()
             plt.title(f'Estimated Abundance {i+1}')
             plt.axis('off')
