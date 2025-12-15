@@ -31,7 +31,7 @@ Place your `.mat` files in the `data/` directory:
 ## Usage
 
 ```bash
-python hyperspectral_unmixing.py
+python hsu.py
 ```
 
 ## Output
