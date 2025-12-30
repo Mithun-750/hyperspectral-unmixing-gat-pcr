@@ -224,15 +224,12 @@ class CrossAttentionFusion(nn.Module):
         FC = torch.sigmoid(self.linear_local(FC_input))  # [B, P, H, W]
         SG_hat = self.beta * FC * SC + SG
 
-        # Use very low temperature to force sharp distributions
-        # Then apply power scaling to further sharpen
-        temperature = 0.3  # Much sharper softmax
+        # Relaxed temperature and power scaling for more realistic mixed pixels
+        temperature = 0.6
         S = F.softmax((SG_hat + SC_hat) / temperature, dim=1)
-        # Power scaling: S^power makes distributions even sharper
-        # This pushes values closer to 0 or 1
-        power = 1.5
-        S = torch.pow(S + 1e-8, 1.0 / power)  # Inverse power = sharper
-        S = S / (S.sum(dim=1, keepdim=True) + 1e-8)  # Renormalize
+        power = 1.2
+        S = torch.pow(S + 1e-8, 1.0 / power)
+        S = S / (S.sum(dim=1, keepdim=True) + 1e-8)
         return S
 
 # ==========================================
@@ -339,10 +336,10 @@ class ACDEDecoder(nn.Module):
                 weights = F.softmax(weights_logits, dim=0)  # [num_pixels]
                 endmember_adaptive = torch.sum(
                     weights.unsqueeze(-1) * class_pixels, dim=0)  # [C]
-                # Reduce adaptive ratio to prevent collapse (50% adaptive, 50% base)
+                # Preserve base endmembers more strongly (80% base, 20% adaptive)
                 # This prevents endmembers from collapsing to average pixel
-                M_adaptive[:, p] = 0.5 * \
-                    endmember_adaptive + 0.5 * M_base[:, p]
+                M_adaptive[:, p] = 0.8 * M_base[:, p] + \
+                    0.2 * endmember_adaptive
 
         M_constrained = torch.clamp(F.relu(M_adaptive), min=0.0, max=2.0)
 
@@ -479,11 +476,10 @@ class MSGACD_Unmixer(nn.Module):
         global_abund_pixel = global_abund_pixel.permute(
             0, 2, 1).view(B, -1, H, W)
 
-        # Use very low temperature + power scaling for sharp abundances
-        temperature = 0.3
+        # Relaxed temperature + power scaling for more realistic abundances
+        temperature = 0.6
         global_abund_pixel = F.softmax(global_abund_pixel / temperature, dim=1)
-        # Power scaling to sharpen
-        power = 1.5
+        power = 1.2
         global_abund_pixel = torch.pow(global_abund_pixel + 1e-8, 1.0 / power)
         global_abund_pixel = global_abund_pixel / \
             (global_abund_pixel.sum(dim=1, keepdim=True) + 1e-8)
@@ -774,6 +770,13 @@ def train_unmixer(data_path=None, endmember_path=None):
         l_sad = sad_loss(img_crop, recon_crop)
         l_mse = F.mse_loss(img_crop, recon_crop)
 
+        # Band variance loss: prevent dumping error into specific spectral ranges
+        l_recon_per_band = torch.mean(
+            (img_crop - recon_crop) ** 2,
+            dim=(2, 3)
+        )  # [B, C]
+        l_band_var = torch.var(l_recon_per_band)
+
         l_sparse = torch.mean(torch.sqrt(
             A + 1e-8)) if epoch >= 150 else torch.tensor(0.0, device=device)
         l_cluster = soft_clustering_loss(
@@ -800,10 +803,14 @@ def train_unmixer(data_path=None, endmember_path=None):
             l_endmember_sad = l_endmember_sad / num_endmembers
 
         mean_abund_per_endmember = torch.mean(A, dim=(0, 2, 3))  # [P]
-        target_mean = 1.0 / num_endmembers
+        # Relaxed target: use clamped actual mean instead of forcing perfect balance
+        target_mean = torch.clamp(
+            mean_abund_per_endmember.detach(),
+            min=0.05,
+            max=0.7
+        )
 
-        # CRITICAL: Strong balance loss to prevent collapse
-        # Use squared error with high penalty for deviation
+        # Relaxed balance loss to prevent collapse without forcing perfect balance
         l_abundance_balance = torch.mean(
             (mean_abund_per_endmember - target_mean) ** 2)
 
@@ -819,30 +826,29 @@ def train_unmixer(data_path=None, endmember_path=None):
         max_abund_per_pixel = torch.max(A, dim=1)[0]  # [B, H, W]
         l_abundance_range = torch.mean(torch.relu(0.8 - max_abund_per_pixel))
 
-        # CRITICAL: Encourage sparsity per pixel (one endmember close to 1.0)
-        # Entropy loss - low entropy = sparse (one dominant endmember)
+        # Allow more mixed pixels - relaxed entropy target
         entropy_per_pixel = - \
             torch.sum(A * torch.log(A + 1e-8), dim=1)  # [B, H, W]
-        # Target entropy for 3 endmembers: log(3) ≈ 1.1 for uniform, 0 for pure
-        # We want strong sparsity: target entropy ≈ 0.1 (many pure pixels)
-        target_entropy = 0.1
+        # Target entropy allows more mixed pixels (0.3 instead of 0.1)
+        target_entropy = 0.3
         l_entropy = torch.mean((entropy_per_pixel - target_entropy) ** 2)
 
-        # Directly encourage high max abundance per pixel
-        # Penalize when max is too low (stronger than range loss)
-        l_max_abund = torch.mean(torch.relu(0.9 - max_abund_per_pixel) ** 2)
+        # Relaxed max abundance threshold to allow more mixed pixels
+        l_max_abund = torch.mean(torch.relu(0.8 - max_abund_per_pixel) ** 2)
 
         # Purity reward: directly reward pixels with one endmember > 0.8
         purity_mask = (max_abund_per_pixel > 0.8).float()
         # Negative = reward (we'll negate in loss)
         l_purity = -torch.mean(purity_mask)
 
-        # Penalize uniform distributions: if max < 0.5, it's too uniform
-        l_uniform_penalty = torch.mean(
-            torch.relu(0.5 - max_abund_per_pixel) ** 2)
+        # Removed l_uniform_penalty to reduce abundance tyranny
+        l_uniform_penalty = torch.tensor(0.0, device=device)
 
         endmember_norms = torch.norm(endmembers, p=2, dim=0)  # [P]
         l_endmember_collapse = torch.mean(torch.exp(-endmember_norms * 5.0))
+
+        # L2 scale regularization: prevent amplitude cheating
+        l_scale = torch.mean((endmember_norms - 1.0) ** 2)
 
         # Compute orthogonality loss
         l_ortho = endmember_orthogonality_loss(endmembers)
@@ -876,11 +882,19 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_graph = 0.0
             w_dirichlet = 0.0
             w_tv = 0.0
-            w_ortho = 0.05 + 0.03 * progress
-            w_endmember_sad = (
-                0.3 + 0.2 * progress) if M_true is not None else 0.0
-            w_abundance_balance = 2.0 + 2.0 * progress
-            w_abundance_max_constraint = 3.0 + 3.0 * progress
+            w_ortho = (0.05 + 0.03 * progress) * 0.7
+            # Increase endmember SAD earlier (starts at epoch 0, ramps up faster)
+            if epoch >= 30:
+                w_endmember_sad = (
+                    0.5 + 0.3 * ((epoch - 30) / 20.0)) if M_true is not None else 0.0
+            else:
+                w_endmember_sad = (
+                    0.3 + 0.2 * (epoch / 30.0)) if M_true is not None else 0.0
+            w_abundance_balance = (2.0 + 2.0 * progress) * \
+                0.65  # Reduced by 35%
+            w_abundance_max_constraint = (
+                3.0 + 3.0 * progress) * 0.65  # Reduced by 35%
+            w_scale = 0.0  # No scale regularization in early phase
             w_abundance_min = 0.5 + 0.5 * progress
             w_abundance_range = 0.2 + 0.2 * progress
             w_entropy = 0.2 + 0.2 * progress
@@ -888,6 +902,7 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_purity = 0.1 + 0.1 * progress
             w_uniform_penalty = 0.2 + 0.2 * progress
             w_endmember_collapse = 0.05 + 0.05 * progress
+            w_band_var = 0.0  # No band variance loss in early phase
             l_dirichlet = torch.tensor(0.0, device=device)
             l_tv_spatial = torch.tensor(0.0, device=device)
             l_graph = torch.tensor(0.0, device=device)
@@ -902,11 +917,14 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_graph = 0.0
             w_dirichlet = 0.0
             w_tv = 0.1 * progress
-            w_ortho = 0.08 + 0.04 * progress
+            w_ortho = (0.08 + 0.04 * progress) * 0.7
             w_endmember_sad = (
                 0.5 + 0.3 * progress) if M_true is not None else 0.0
-            w_abundance_balance = 4.0 + 4.0 * progress
-            w_abundance_max_constraint = 6.0 + 6.0 * progress
+            w_abundance_balance = (4.0 + 4.0 * progress) * \
+                0.65  # Reduced by 35%
+            w_abundance_max_constraint = (
+                6.0 + 6.0 * progress) * 0.65  # Reduced by 35%
+            w_scale = 0.0  # No scale regularization in phase 2
             w_abundance_min = 1.0 + 1.5 * progress
             w_abundance_range = 0.4 + 0.4 * progress
             w_entropy = 0.4 + 0.4 * progress
@@ -914,6 +932,7 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_purity = 0.2 + 0.2 * progress
             w_uniform_penalty = 0.4 + 0.4 * progress
             w_endmember_collapse = 0.1 + 0.05 * progress
+            w_band_var = 0.0  # No band variance loss in phase 2
             l_tv_spatial = reweighted_tv_loss(
                 A, img_crop, alpha=1.0) if progress > 0.5 else torch.tensor(0.0, device=device)
             l_graph = torch.tensor(0.0, device=device)
@@ -924,6 +943,14 @@ def train_unmixer(data_path=None, endmember_path=None):
             # 0->1 over first 20 epochs
             warmup_progress = min((epoch - 150) / 20.0, 1.0)
 
+            # After epoch 200, let endmembers win: reduce abundance weights further
+            if epoch >= 200:
+                abundance_reduction = 0.7  # Additional 30% reduction
+                w_endmember_sad_val = 1.4
+            else:
+                abundance_reduction = 1.0  # No additional reduction before epoch 200
+                w_endmember_sad_val = 0.8 + 0.15 * phase3_progress * warmup_progress
+
             w_sad = 2.0
             w_mse = 1.0
             w_sparse = 0.1
@@ -932,12 +959,16 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_graph = 0.01 * phase3_progress * warmup_progress  # Very gradual
             w_dirichlet = 0.0
             w_tv = 0.1 + 0.03 * phase3_progress * warmup_progress
-            w_ortho = 0.12 + 0.05 * phase3_progress * warmup_progress
-            w_endmember_sad = (
-                0.8 + 0.15 * phase3_progress * warmup_progress) if M_true is not None else 0.0
-            # Start from Phase 2 end values and ramp very slowly
-            w_abundance_balance = 8.0 + 2.0 * phase3_progress * warmup_progress
-            w_abundance_max_constraint = 12.0 + 3.0 * phase3_progress * warmup_progress
+            w_ortho = (0.12 + 0.05 * phase3_progress * warmup_progress) * 0.7
+            w_endmember_sad = w_endmember_sad_val if M_true is not None else 0.0
+            # Start from Phase 2 end values and ramp very slowly (reduced by 35%, then additional 30% after epoch 200)
+            w_abundance_balance = (
+                8.0 + 2.0 * phase3_progress * warmup_progress) * 0.65 * abundance_reduction
+            w_abundance_max_constraint = (
+                12.0 + 3.0 * phase3_progress * warmup_progress) * 0.65 * abundance_reduction
+            # Gradually introduce scale regularization
+            w_scale = 0.02 + 0.03 * phase3_progress * warmup_progress
+            w_band_var = 0.02  # Band variance loss weight
             w_abundance_min = 2.5 + 1.0 * phase3_progress * warmup_progress
             w_abundance_range = 0.8 + 0.4 * phase3_progress * warmup_progress
             w_entropy = 0.8 + 0.4 * phase3_progress * warmup_progress
@@ -960,7 +991,8 @@ def train_unmixer(data_path=None, endmember_path=None):
             else:
                 l_graph = torch.tensor(0.0, device=device)
         else:
-            # Phase 4: Full strength (stable, matching Phase 3 end)
+            # Phase 4: Full strength - prioritize endmember SAD, relax abundance constraints
+            # After epoch 200, further reduce abundance weights by 30% and increase endmember SAD
             w_sad = 2.0
             w_mse = 1.0
             w_sparse = 0.1
@@ -969,10 +1001,13 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_graph = 0.01
             w_dirichlet = 0.0
             w_tv = 0.13
-            w_ortho = 0.17
-            w_endmember_sad = 0.95 if M_true is not None else 0.0
-            w_abundance_balance = 10.0
-            w_abundance_max_constraint = 15.0
+            w_ortho = 0.17 * 0.7
+            # Increased to prioritize endmember accuracy (1.4 after epoch 200)
+            w_endmember_sad = 1.4 if M_true is not None else 0.0
+            # Reduced from 10.0 (40% reduction), then additional 30% = 6.0 * 0.7 = 4.2
+            w_abundance_balance = 6.0 * 0.7
+            # Reduced from 15.0 (40% reduction), then additional 30% = 9.0 * 0.7 = 6.3
+            w_abundance_max_constraint = 9.0 * 0.7
             w_abundance_min = 3.5
             w_abundance_range = 1.2
             w_entropy = 1.2
@@ -980,6 +1015,8 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_purity = 0.6
             w_uniform_penalty = 1.2
             w_endmember_collapse = 0.18
+            w_scale = 0.05  # L2 scale regularization weight
+            w_band_var = 0.02  # Band variance loss weight
             l_tv_spatial = reweighted_tv_loss(A, img_crop, alpha=1.0)
             B, K, P = global_abund.shape
             adj_float = adj.float()
@@ -1012,7 +1049,9 @@ def train_unmixer(data_path=None, endmember_path=None):
             w_max_abund * l_max_abund +
             w_purity * l_purity +
             w_uniform_penalty * l_uniform_penalty +
-            w_endmember_collapse * l_endmember_collapse
+            w_endmember_collapse * l_endmember_collapse +
+            w_scale * l_scale +
+            w_band_var * l_band_var
         )
 
         # Adaptive scaling: if constraints dominate, scale them down
@@ -1060,7 +1099,9 @@ def train_unmixer(data_path=None, endmember_path=None):
             'max_abund': l_max_abund.item(),
             'purity': l_purity.item(),
             'uniform_penalty': l_uniform_penalty.item(),
-            'endmember_collapse': l_endmember_collapse.item()
+            'endmember_collapse': l_endmember_collapse.item(),
+            'scale': l_scale.item(),
+            'band_var': l_band_var.item()
         })
 
         if (epoch + 1) % 10 == 0:
